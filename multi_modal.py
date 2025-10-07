@@ -13,6 +13,7 @@ from datasets import load_dataset, Image, DatasetDict, Dataset
 from PIL import Image as PILImage
 from byaldi import RAGMultiModalModel
 
+from settings import *
 from chartqa_dataset import load_chartqa_dataset
 
 
@@ -67,18 +68,18 @@ def load_retriever(
 class MultiModalRetriever:
     def __init__(
         self, 
-        model_name: str = "vidore/colpali-v1.3", 
+        model_name: str = "colpali13", 
         split: str = "val", 
         root_dir: str | None = None
     ):
         if root_dir is None:
-            root_dir = os.path.expanduser("~/scratch/td2_usecase/data")
-        os.makedirs(root_dir, exist_ok=True)
+            root_dir = TEAM_ROOT_DIR
 
         self.imgs_dir = f"{root_dir}/chartqa_images/{split}"
         store_chartqa_images(split=split, save_dir=self.imgs_dir)
-        
-        self.model = load_retriever(model_name,
+
+        # self.model_name = model_name
+        self.model = load_retriever(RET_MODEL_PATHS[model_name],
                                     imgs_dir=self.imgs_dir,
                                     index_root=f"{root_dir}/.byaldi",
                                     index_name=f"chartqa_{split}_index")
@@ -123,11 +124,13 @@ class MultiModalRetriever:
 class MultiModalGenerator:
     def __init__(
         self, 
-        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+        model_name: str = "qwen25_vl_7b_instruct"
     ):
+        model_path = GEN_MODEL_PATHS[model_name]
+        
         # Initialize VLM
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_name,
+            model_path,
             torch_dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map="cuda",
@@ -138,7 +141,7 @@ class MultiModalGenerator:
         min_pixels = 224*224
         max_pixels = 1024*1024
         self.processor = AutoProcessor.from_pretrained(
-            model_name,
+            model_path,
             min_pixels=min_pixels,
             max_pixels=max_pixels
         )
@@ -316,26 +319,20 @@ Your binary 0-1 score:
 
         return metrics
         
-    def _aggregate_metrics(self, dset: Dataset) -> pd.DataFrame:
-        def stats(values: list[float]) -> dict:
-            return {
-                'mean': np.nanmean(values),
-                'std': np.nanstd(values),
-            }
-
+    def _aggregate_metrics(self, dset: Dataset) -> dict:
         cols = ['ret_recall', 'gen_correctness']
-        metrics =  {col: stats(dset[col]) for col in dset.column_names if col in cols}
-        return pd.DataFrame(metrics).round(4)
+        metrics =  {col: np.nanmean(dset[col]).item() for col in dset.column_names if col in cols}
+        return metrics
     
     def run_and_evaluate_all(
         self, 
         dset: Dataset,
-        query_column: str = "qwen25_7b_query",
-        gt_answer_column: str = "qwen25_7b_label",
+        query_column: str = "refined_query",
+        gt_answer_column: str = "refined_label",
         gt_image_id_column: str = "image_id",
         k: int = 3,
         save_dir: str | None = None,
-    ) -> tuple[Dataset, pd.DataFrame]:
+    ) -> tuple[Dataset, dict]:
         
         # Load results from disk if exists
         if save_dir is not None and os.path.exists(save_dir):
@@ -375,4 +372,3 @@ Your binary 0-1 score:
             dset.save_to_disk(save_dir)
         
         return dset, self._aggregate_metrics(dset)
-

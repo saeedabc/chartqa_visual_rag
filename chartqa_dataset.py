@@ -3,6 +3,7 @@ import hashlib
 
 
 def load_chartqa_dataset(split: str = None) -> DatasetDict | Dataset:
+    
     # Load dataset
     dset = load_dataset("HuggingFaceM4/ChartQA", split=split)
 
