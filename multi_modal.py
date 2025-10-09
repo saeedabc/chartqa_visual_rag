@@ -3,7 +3,10 @@ from typing import Callable
 import io
 import json
 from collections import defaultdict
+import argparse
+from pathlib import Path
 from tqdm.auto import tqdm
+from thefuzz import fuzz
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -79,12 +82,12 @@ class MultiModalRetriever:
         self.imgs_dir = f"{root_dir}/chartqa_images/{split}"
         store_chartqa_images(split=split, save_dir=self.imgs_dir)
 
-        # self.model_name = model_name
+        self.model_name = model_name
         self.model = load_retriever(RET_MODEL_PATHS[model_name],
                                     imgs_dir=self.imgs_dir,
                                     index_root=f"{root_dir}/.byaldi",
-                                    index_name=f"chartqa_{split}_index")
-
+                                    index_name=f"chartqa_{split}_index_{model_name}")
+        
     def search(
         self, 
         query: str, 
@@ -127,6 +130,7 @@ class MultiModalGenerator:
         self, 
         model_name: str = "qwen25_vl_7b_instruct"
     ):
+        self.model_name = model_name
         model_path = GEN_MODEL_PATHS[model_name]
         
         # Initialize VLM
@@ -153,7 +157,7 @@ class MultiModalGenerator:
         query: str | None = None, 
         images: list | None = None, 
         messages: list[dict] | None = None,
-        max_new_tokens: int = 500,
+        max_new_tokens: int = 2048,
         output_parser: Callable | None = None,
         verbose: bool = False,
     ) -> str:
@@ -238,6 +242,7 @@ class MultiModalRAG:
         self, 
         query: str, 
         k: int = 3, 
+        max_new_tokens: int = 2048,
         verbose: bool = False
     ) -> tuple[list[dict], dict]:
         
@@ -312,6 +317,7 @@ Your json response including "answer", "short_answer", and "references" keys and
         gen_result = self.generator.generate(system_prompt=system_prompt,
                                              query=prompt,
                                              images=images,
+                                             max_new_tokens=max_new_tokens,
                                              output_parser=parse_result,
                                              verbose=verbose)
 
@@ -340,7 +346,7 @@ Your json response including "answer", "short_answer", and "references" keys and
         metrics = {}
 
         metrics |= self._evaluate_generator_answer_correctness(query, gen_result['answer'], gt_answer)
-        metrics |= self._evaluate_generator_short_answer_exact_match(gen_result['short_answer'], gt_answer)
+        metrics |= self._evaluate_generator_short_answer_correctness(gen_result['short_answer'], gt_answer)
         metrics |= self._evaluate_generator_references(gen_result['references'], gt_image_id)
 
         return metrics
@@ -353,9 +359,15 @@ Your json response including "answer", "short_answer", and "references" keys and
 
         return {'gen_precision': precision, 'gen_recall': recall}
         
-    def _evaluate_generator_short_answer_exact_match(self, gen_short_answer: str, gt_answer: str) -> dict[str, float]:
-        em = 1.0 if gen_short_answer.strip().lower() == gt_answer.strip().lower() else 0.0
-        return {'gen_em': em}
+    def _evaluate_generator_short_answer_correctness(self, gen_short_answer: str, gt_answer: str) -> dict[str, float]:
+        exact_match = 1.0 if gen_short_answer.strip().lower() == gt_answer.strip().lower() else 0.0
+        soft_match = fuzz.ratio(gen_short_answer, gt_answer) / 100
+        partial_soft_match = fuzz.partial_ratio(gen_short_answer, gt_answer) / 100
+        return {
+            'gen_exact_match': exact_match,
+            'gen_soft_match': soft_match,
+            'gen_soft_match_partial': partial_soft_match,
+        }
         
     def _evaluate_generator_answer_correctness(self, query: str, gen_answer: str, gt_answer: str) -> dict[str, float]:
         system_prompt = """You are a helpful evaluator.
@@ -415,27 +427,50 @@ Your binary 0-1 score:
             metrics |= self._evaluate_generator(query, gen_result, gt_answer, gt_image_id)
 
         return metrics
-        
-    def _aggregate_metrics(self, dset: Dataset) -> dict:
-        cols = ['ret_precision', 'ret_recall', 'gen_precision', 'gen_recall', 'gen_em', 'gen_correctness']
+
+    @staticmethod
+    def aggregate_metrics(dset: Dataset) -> dict:
+        cols = [
+            'ret_precision', 'ret_recall', 
+            'gen_precision', 'gen_recall', 
+            'gen_exact_match', 'gen_soft_match', 'gen_soft_match_partial', 
+            'gen_correctness',
+        ]
         metrics =  {col: np.nanmean(dset[col]).item() for col in dset.column_names if col in cols}
         return metrics
     
-    def run_and_evaluate_all(
+    def run_and_evaluate_dset(
         self, 
-        dset: Dataset,
+        # dset: Dataset,
+        dset_path: str,
         query_column: str = "refined_query",
         gt_answer_column: str = "refined_label",
         gt_image_id_column: str = "image_id",
+        keep_unsafe_qas: bool = False,
+        original_gt_answer_column: str = "label",
         k: int = 3,
         save_dir: str | None = None,
+        force_update: bool = False,
     ) -> tuple[Dataset, dict]:
+
+        if not os.path.exists(dset_path):
+            raise ValueError(f"{dset_path} does not exist.")
+            
+        dset = Dataset.load_from_disk(dset_path)
+
+        if not keep_unsafe_qas:
+            dset = dset.filter(lambda row: row[original_gt_answer_column] == row[gt_answer_column])
+    
+        if save_dir is None:
+            ret_model_name = self.retriever.model_name
+            gen_model_name = self.generator.model_name
+            save_dir = Path(dset_path).parent / f"{Path(dset_path).stem}_rag_results_{len(dset)}_{ret_model_name}_{gen_model_name}"
         
         # Load results from disk if exists
-        if save_dir is not None and os.path.exists(save_dir):
+        if not force_update and os.path.exists(save_dir):
             print(f"Loading RAG results from {save_dir}")
             dset = Dataset.load_from_disk(save_dir)
-            return dset, self._aggregate_metrics(dset)
+            return dset, self.aggregate_metrics(dset)
             
         new_columns = defaultdict(list)
     
@@ -465,8 +500,43 @@ Your binary 0-1 score:
             dset = dset.add_column(col, new_columns[col])
 
         # Save results to disk
-        if save_dir is not None:
-            print(f"Saving RAG results to {save_dir}")
-            dset.save_to_disk(save_dir)
+        print(f"Saving RAG results to {save_dir}")
+        dset.save_to_disk(save_dir)
         
-        return dset, self._aggregate_metrics(dset)
+        return dset, self.aggregate_metrics(dset)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run RAG and evaluate a refined ChartQA dataset")
+
+    parser.add_argument("--ret_model_name", type=str, default="colpali13", help="Name of the RAG's retriever model")
+    parser.add_argument("--gen_model_name", type=str, default="qwen25_vl_7b_instruct", help="Name of the RAG's generator model")
+    
+    parser.add_argument("--dset_path", type=str, required=True, help="Path to the dataset directory.")
+    parser.add_argument("--query_column", type=str, default="refined_query", help="Name of the query column.")
+    parser.add_argument("--gt_answer_column", type=str, default="refined_label", help="Name of the ground truth answer column.")
+    parser.add_argument("--gt_image_id_column", type=str, default="image_id", help="Name of the ground truth image ID column.")
+    parser.add_argument("--keep_unsafe_qas", action="store_true", help="Keep unsafe QAs (default: False).")
+    parser.add_argument("--original_gt_answer_column", type=str, default="label", help="Name of the original ground truth answer column.")
+    parser.add_argument("-k", type=int, default=3, help="Number of top results to consider.")
+    parser.add_argument("--save_dir", type=str, default=None, help="Directory to save results (optional).")
+    parser.add_argument("--force_update", action="store_true", help="Force re-run even if results already exist.")
+
+    args = parser.parse_args()
+
+    rag = MultiModalRAG(
+        retriever_args=dict(model_name=args.ret_model_name),
+        generator_args=dict(model_name=args.gen_model_name),
+    )
+
+    result = rag.run_and_evaluate_dset(
+        dset_path=args.dset_path,
+        query_column=args.query_column,
+        gt_answer_column=args.gt_answer_column,
+        gt_image_id_column=args.gt_image_id_column,
+        keep_unsafe_qas=args.keep_unsafe_qas,
+        original_gt_answer_column=args.original_gt_answer_column,
+        k=args.k,
+        save_dir=args.save_dir,
+        force_update=args.force_update,
+    )
