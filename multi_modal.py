@@ -40,27 +40,26 @@ def load_retriever(
     index_name: str
 ) -> RAGMultiModalModel:    
 
-    index_path = f'{index_root}/{index_name}'
+    full_index_path = f'{index_root}/{index_name}'
     
-    if not os.path.exists(index_path):
+    if not os.path.exists(full_index_path):
+        
         ret_model = RAGMultiModalModel.from_pretrained(model_name, index_root=index_root)
-        # ret_model = RAGMultiModalModel.from_pretrained("vidore/colqwen2.5-v0.2")
-    
         metadata = [{"image_name": f} for f in os.listdir(imgs_dir)]
-        # img_ids = [m["filename"].rstrip('.png') for m in metadata]
         
         ret_model.index(
             input_path=imgs_dir,
             index_name=index_name,
-            # doc_ids=img_ids,
             metadata=metadata,
             store_collection_with_index=False,
             overwrite=True
         )
+        
     else:
+        
         ret_model = RAGMultiModalModel.from_index(
-            index_path=index_path,
-            index_root=index_root,
+            index_root = index_root,
+            index_path = index_name,
         )
 
     return ret_model
