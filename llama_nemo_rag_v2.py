@@ -101,7 +101,7 @@ class RAGMultiModalModel:
     @classmethod
     def from_pretrained(
         cls,
-        model_name: str = "nvidia/llama-nemoretriever-colembed-3b-v1",
+        model_name: str ,
         device_map: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         **hf_kwargs,
